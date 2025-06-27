@@ -25,7 +25,8 @@ class HDF5DataGenerator(tf.keras.utils.Sequence):
                  hdf5_path: str,
                  indices: List[int],
                  batch_size: int = 32,
-                 shuffle: bool = True):
+                 shuffle: bool = True,
+                 scaler=None):
         """
         初始化HDF5数据生成器
         
@@ -34,11 +35,13 @@ class HDF5DataGenerator(tf.keras.utils.Sequence):
             indices: 数据索引列表
             batch_size: 批次大小
             shuffle: 是否打乱数据
+            scaler: 特征标准化器
         """
         self.hdf5_path = hdf5_path
         self.indices = indices
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.scaler = scaler
         
         # 创建HDF5管理器
         self.hdf5_manager = HDF5DataManager(hdf5_path, mode='r')
@@ -56,23 +59,59 @@ class HDF5DataGenerator(tf.keras.utils.Sequence):
         end_idx = min((batch_idx + 1) * self.batch_size, len(self.indices))
         batch_indices = self.indices[start_idx:end_idx]
         
+        # HDF5要求索引是递增的，所以先排序
+        sorted_batch_indices = sorted(batch_indices)
+        
         # 读取数据
-        batch_data = self._load_batch_data(batch_indices)
+        batch_data = self._load_batch_data(sorted_batch_indices)
+        
+        # 如果原来的顺序是乱序的，需要重新排列
+        if batch_indices != sorted_batch_indices:
+            # 创建原索引到排序后索引的映射
+            index_map = {orig_idx: new_pos for new_pos, orig_idx in enumerate(sorted_batch_indices)}
+            reorder_indices = [index_map[idx] for idx in batch_indices]
+            
+            # 重新排列数据
+            batch_data['images'] = batch_data['images'][reorder_indices]
+            batch_data['vectors'] = batch_data['vectors'][reorder_indices]
+            batch_data['labels'] = batch_data['labels'][reorder_indices]
         
         # 返回 (inputs, outputs) 格式
-        X = [batch_data['image_features'], batch_data['vector_features']]
+        X = [batch_data['images'], batch_data['vectors']]
         y = batch_data['labels']
         
         return X, y
     
     def _load_batch_data(self, batch_indices: List[int]) -> Dict:
         """从HDF5文件加载批次数据"""
-        with self.hdf5_manager.open_file() as f:
-            batch_data = {
-                'image_features': f['image_features'][batch_indices],
-                'vector_features': f['vector_features'][batch_indices],
-                'labels': f['labels'][batch_indices]
-            }
+        # 确保数据集已加载
+        if not hasattr(self.hdf5_manager, 'datasets') or not self.hdf5_manager.datasets:
+            self.hdf5_manager._load_existing_datasets()
+        
+        # 读取批次数据
+        images = self.hdf5_manager.datasets['images'][batch_indices]
+        vectors = self.hdf5_manager.datasets['vectors'][batch_indices]
+        labels = self.hdf5_manager.datasets['labels'][batch_indices]
+        
+        # 图像数据预处理
+        images = images[..., np.newaxis]  # 添加通道维度
+        
+        # 逐样本归一化图像数据
+        for i in range(len(images)):
+            max_val = np.max(images[i])
+            if max_val > 1e-8:
+                images[i] = images[i] / max_val
+        
+        # 标准化向量特征（使用之前训练的scaler）
+        from sklearn.preprocessing import StandardScaler
+        if hasattr(self, 'scaler') and self.scaler is not None:
+            vectors = self.scaler.transform(vectors)
+        
+        batch_data = {
+            'images': images,
+            'vectors': vectors,
+            'labels': labels
+        }
         
         return batch_data
     
@@ -182,14 +221,19 @@ class HybridChannelingModel:
         
         # 创建HDF5管理器获取数据信息
         hdf5_manager = HDF5DataManager(hdf5_path, mode='r')
-        data_info = hdf5_manager.get_data_info()
-        total_samples = data_info['total_samples']
+        data_info = hdf5_manager.get_dataset_info()
+        # 确保total_samples是整数类型
+        total_samples = int(data_info['total_samples']) if isinstance(data_info['total_samples'], str) else data_info['total_samples']
         
         logger.info(f"HDF5数据集信息:")
         logger.info(f"  总样本数: {total_samples}")
         logger.info(f"  图像特征形状: {data_info['image_shape']}")
         logger.info(f"  向量特征维度: {data_info['vector_dim']}")
-        logger.info(f"  文件大小: {data_info['file_size_mb']:.2f} MB")
+        
+        # 计算文件大小
+        import os
+        file_size_mb = os.path.getsize(hdf5_path) / (1024**2)
+        logger.info(f"  文件大小: {file_size_mb:.2f} MB")
         
         # 生成随机索引
         np.random.seed(random_seed)
@@ -220,19 +264,21 @@ class HybridChannelingModel:
         logger.info("计算数值特征标准化参数...")
         
         hdf5_manager = HDF5DataManager(hdf5_path, mode='r')
+        hdf5_manager._load_existing_datasets()
+        
+        # HDF5要求索引是递增的，所以先排序
+        sorted_train_indices = sorted(train_indices)
         
         # 分批读取训练数据来计算统计量
-        batch_size = 1000
+        batch_size = min(1000, len(sorted_train_indices))
         all_vector_features = []
         
-        for i in range(0, len(train_indices), batch_size):
-            batch_indices = train_indices[i:i+batch_size]
-            batch_data = hdf5_manager.read_batch(0, len(batch_indices))  # 这里需要修改read_batch方法
+        for i in range(0, len(sorted_train_indices), batch_size):
+            batch_indices = sorted_train_indices[i:i+batch_size]
             
-            # 临时解决方案：直接读取指定索引的数据
-            with hdf5_manager.open_file() as f:
-                vector_features = f['vector_features'][batch_indices]
-                all_vector_features.append(vector_features)
+            # 直接从数据集中读取指定索引的数据
+            vector_features = hdf5_manager.datasets['vectors'][batch_indices]
+            all_vector_features.append(vector_features)
         
         # 合并所有批次的数据
         train_vector_features = np.vstack(all_vector_features)
@@ -241,6 +287,48 @@ class HybridChannelingModel:
         self.scaler.fit(train_vector_features)
         
         logger.info("数值特征标准化参数计算完成")
+    
+    def _load_data_from_indices(self, hdf5_path: str, indices: List[int]) -> Tuple:
+        """从HDF5文件根据索引加载数据"""
+        hdf5_manager = HDF5DataManager(hdf5_path, mode='r')
+        hdf5_manager._load_existing_datasets()
+        
+        # 排序索引以符合HDF5要求
+        sorted_indices = sorted(indices)
+        
+        # 读取数据
+        images = hdf5_manager.datasets['images'][sorted_indices]
+        vectors = hdf5_manager.datasets['vectors'][sorted_indices]
+        labels = hdf5_manager.datasets['labels'][sorted_indices]
+        
+        # 如果原来的顺序是乱序的，需要重新排列
+        if indices != sorted_indices:
+            # 创建排序后索引到原索引的映射
+            index_map = {sorted_idx: orig_pos for orig_pos, sorted_idx in enumerate(sorted_indices)}
+            reorder_indices = [index_map[idx] for idx in indices]
+            
+            # 重新排列数据
+            images = images[reorder_indices]
+            vectors = vectors[reorder_indices]
+            labels = labels[reorder_indices]
+        
+        # 图像数据预处理
+        images = images[..., np.newaxis]  # 添加通道维度
+        
+        # 逐样本归一化图像数据
+        for i in range(len(images)):
+            max_val = np.max(images[i])
+            if max_val > 1e-8:
+                images[i] = images[i] / max_val
+        
+        # 标准化向量特征
+        vectors = self.scaler.transform(vectors)
+        
+        # 返回输入和输出
+        X = [images, vectors]
+        y = labels
+        
+        return X, y
     
     def train_from_hdf5(self, 
                        hdf5_path: str,
@@ -270,11 +358,13 @@ class HybridChannelingModel:
         train_indices, val_indices, test_indices, total_samples = self.prepare_data_from_hdf5(
             hdf5_path, test_size, val_size)
         
-        # 创建数据生成器
-        train_generator = HDF5DataGenerator(
-            hdf5_path, train_indices, batch_size, shuffle=True)
-        val_generator = HDF5DataGenerator(
-            hdf5_path, val_indices, batch_size, shuffle=False)
+        # 由于HDF5数据生成器在新版TensorFlow中有兼容性问题，
+        # 我们改用传统方法：批量读取数据到内存中进行训练
+        logger.info("从HDF5加载训练数据到内存...")
+        
+        # 加载训练数据
+        train_data = self._load_data_from_indices(hdf5_path, train_indices)
+        val_data = self._load_data_from_indices(hdf5_path, val_indices)
         
         # 设置回调函数
         callbacks = [
@@ -302,9 +392,10 @@ class HybridChannelingModel:
         
         # 训练模型
         history = self.model.fit(
-            train_generator,
-            validation_data=val_generator,
+            train_data[0], train_data[1],
+            validation_data=(val_data[0], val_data[1]),
             epochs=epochs,
+            batch_size=batch_size,
             callbacks=callbacks,
             verbose=1
         )
@@ -314,11 +405,10 @@ class HybridChannelingModel:
         
         # 评估模型
         if len(test_indices) > 0:
-            test_generator = HDF5DataGenerator(
-                hdf5_path, test_indices, batch_size, shuffle=False)
-            
             logger.info("评估测试集性能...")
-            test_metrics = self.model.evaluate(test_generator, verbose=0)
+            test_data = self._load_data_from_indices(hdf5_path, test_indices)
+            
+            test_metrics = self.model.evaluate(test_data[0], test_data[1], verbose=0)
             
             logger.info("测试集评估结果:")
             for name, value in zip(self.model.metrics_names, test_metrics):

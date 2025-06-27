@@ -311,6 +311,90 @@ class DataVisualizer:
     """数据可视化器"""
     
     @staticmethod
+    def plot_data_analysis(images: np.ndarray, vectors: np.ndarray, 
+                          labels: np.ndarray, save_path: Optional[str] = None):
+        """
+        绘制数据分析图表
+        
+        Args:
+            images: 图像特征数组
+            vectors: 向量特征数组  
+            labels: 标签数组
+            save_path: 保存路径
+        """
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # 标签分布直方图
+        axes[0, 0].hist(labels, bins=30, alpha=0.7, color='green', edgecolor='black')
+        axes[0, 0].set_title('Channeling Ratio Distribution')
+        axes[0, 0].set_xlabel('Channeling Ratio')
+        axes[0, 0].set_ylabel('Sample Count')
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # 图像特征统计 - 最大值分布
+        image_max_vals = np.max(images.reshape(images.shape[0], -1), axis=1)
+        axes[0, 1].hist(image_max_vals, bins=30, alpha=0.7, color='blue', edgecolor='black')
+        axes[0, 1].set_title('Image Feature Max Values')
+        axes[0, 1].set_xlabel('Max Value')
+        axes[0, 1].set_ylabel('Sample Count')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # 向量特征相关性热力图
+        import seaborn as sns
+        # 处理零方差特征避免NaN值
+        vectors_for_corr = vectors.copy()
+        for i in range(vectors.shape[1]):
+            if np.std(vectors[:, i]) == 0:
+                vectors_for_corr[:, i] += np.random.normal(0, 1e-8, vectors.shape[0])
+        
+        vector_corr = np.corrcoef(vectors_for_corr.T)
+        # 处理NaN值
+        vector_corr = np.nan_to_num(vector_corr, nan=0.0)
+        
+        feature_names = ['Max Amp', 'RMS Amp', 'Energy', 'Zero Cross', 
+                        'Dom Freq', 'Spect Cent', 'Receiver', 'Azimuth']
+        sns.heatmap(vector_corr, annot=True, cmap='coolwarm', center=0,
+                   xticklabels=feature_names, yticklabels=feature_names,
+                   ax=axes[0, 2], fmt='.2f')
+        axes[0, 2].set_title('Vector Features Correlation')
+        
+        # 标签vs主要特征的散点图
+        axes[1, 0].scatter(vectors[:, 0], labels, alpha=0.6, s=20)
+        axes[1, 0].set_xlabel('Max Amplitude')
+        axes[1, 0].set_ylabel('Channeling Ratio')
+        axes[1, 0].set_title('Max Amplitude vs Channeling Ratio')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # 能量特征vs标签
+        axes[1, 1].scatter(vectors[:, 2], labels, alpha=0.6, s=20)
+        axes[1, 1].set_xlabel('Energy')
+        axes[1, 1].set_ylabel('Channeling Ratio')
+        axes[1, 1].set_title('Energy vs Channeling Ratio')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        # 样本图像示例 - 显示一个代表性样本
+        # 选择中位数样本
+        mid_idx = np.argmin(np.abs(labels - np.median(labels)))
+        sample_image = images[mid_idx]
+        sample_label = labels[mid_idx]
+        
+        # 在最后一个子图显示样本图像
+        im = axes[1, 2].imshow(sample_image, aspect='auto', cmap='viridis')
+        axes[1, 2].set_title(f'Sample Scalogram (ratio={sample_label:.3f})')
+        axes[1, 2].set_xlabel('Time Samples')
+        axes[1, 2].set_ylabel('Wavelet Scale')
+        plt.colorbar(im, ax=axes[1, 2])
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            logger.info(f"数据分析图表保存至: {save_path}")
+            plt.close()
+        else:
+            plt.show()
+    
+    @staticmethod
     def plot_data_overview(cast_data: Dict, xsilmr_sample: Dict, 
                           save_path: Optional[str] = None):
         """
