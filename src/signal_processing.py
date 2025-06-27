@@ -155,18 +155,22 @@ class SignalProcessor:
                 filtered[:, col] = filtfilt(self.b, self.a, waveform[:, col])
             return filtered
     
-    def slowness_time_coherence(self, waveforms: Dict, window_size: int = 5) -> Tuple[np.ndarray, Dict, Optional[np.ndarray]]:
+    def slowness_time_coherence(self, waveforms: Dict, window_size: int = 5, 
+                               slowness_range: Tuple[float, float] = (40, 250),
+                               n_slowness_samples: int = 50) -> Tuple[np.ndarray, Dict, Optional[np.ndarray]]:
         """
-        慢度-时间相干性分析 (使用稳健的线性回归方法)
+        慢度-时间相干性分析 (改进版：使用慢度扫描和Semblance算法)
         
         Args:
             waveforms: 多个接收器的波形字典 {receiver_id: waveform}
             window_size: 滑动窗口大小
+            slowness_range: 慢度扫描范围 (µs/ft)
+            n_slowness_samples: 慢度采样点数
             
         Returns:
-            局部慢度数组, 相干滤波后的波形字典, R²质量指标数组(可选)
+            最佳慢度数组, 相干滤波后的波形字典, Semblance质量指标数组
         """
-        logger.info("执行慢度-时间相干性分析...")
+        logger.info("执行改进的慢度-时间相干性分析...")
         
         # 获取所有接收器ID并排序
         receiver_ids = sorted(waveforms.keys())
@@ -181,77 +185,151 @@ class SignalProcessor:
         n_time, n_depth = waveforms[first_key].shape
         
         # 初始化输出
-        local_slowness = np.zeros((n_receivers, n_depth))
-        quality_metrics = np.zeros((n_receivers, n_depth))  # 存储R²值
+        best_slowness = np.zeros((n_receivers, n_depth))
+        semblance_quality = np.zeros((n_receivers, n_depth))
         coherent_waveforms = {}
         
         # 接收器间距 (0.5 ft)
         receiver_spacing = 0.5
         
+        # 慢度扫描参数
+        slowness_samples = np.linspace(slowness_range[0], slowness_range[1], n_slowness_samples)
+        slowness_samples_s = slowness_samples * 1e-6  # 转换为s/ft
+        
         for i, receiver_id in enumerate(receiver_ids):
+            logger.info(f"处理接收器 {receiver_id} ({i+1}/{n_receivers})")
+            
             # 为每个接收器创建滑动窗口
             start_idx = max(0, i - window_size//2)
             end_idx = min(n_receivers, start_idx + window_size)
             window_receivers = receiver_ids[start_idx:end_idx]
             
-            # 提取窗口内的波形
+            # 提取窗口内的波形并计算相对位置
             window_waveforms = []
-            for wr_id in window_receivers:
+            window_positions = []  # 相对于中心接收器的位置
+            center_idx = i
+            
+            for j, wr_id in enumerate(window_receivers):
                 if wr_id in waveforms:
                     window_waveforms.append(waveforms[wr_id])
+                    # 计算相对位置
+                    actual_idx = start_idx + j
+                    position = (actual_idx - center_idx) * receiver_spacing
+                    window_positions.append(position)
             
             if len(window_waveforms) < 2:
                 # 不足够的接收器进行相干分析，使用原始波形
                 coherent_waveforms[receiver_id] = waveforms[receiver_id]
-                local_slowness[i, :] = 0.0
+                best_slowness[i, :] = 0.0
                 continue
             
             window_array = np.stack(window_waveforms, axis=0)  # (n_window, n_time, n_depth)
+            window_positions = np.array(window_positions)
             
-            # 对每个深度点进行处理
+            # 对每个深度点进行慢度扫描
             coherent_wave = np.zeros((n_time, n_depth))
             
             for depth_idx in range(n_depth):
+                if depth_idx % 1000 == 0:
+                    logger.debug(f"  处理深度点 {depth_idx}/{n_depth}")
+                
                 depth_traces = window_array[:, :, depth_idx]  # (n_window, n_time)
                 
-                # 简化的相干处理：计算窗口内波形的相关性
                 if len(window_waveforms) >= 2:
-                    # 寻找最大相干的时延
-                    reference_trace = depth_traces[len(depth_traces)//2]  # 使用中间接收器作为参考
-                    coherent_trace = np.zeros_like(reference_trace, dtype=np.float64)
+                    # 慢度扫描
+                    max_semblance = -1
+                    optimal_slowness = 0
+                    optimal_aligned_traces = None
                     
-                    for trace in depth_traces:
-                        # 互相关计算时延
-                        correlation = np.correlate(reference_trace, trace, mode='full')
-                        max_corr_idx = np.argmax(np.abs(correlation))
-                        delay = max_corr_idx - len(reference_trace) + 1
+                    for slowness in slowness_samples_s:
+                        # 计算每个接收器的理论时延
+                        delays_samples = slowness * window_positions / self.dt  # 转换为采样点数
                         
-                        # 应用时延校正后叠加
-                        if delay != 0:
-                            if delay > 0:
-                                aligned_trace = np.concatenate([np.zeros(delay), trace[:-delay]])
-                            else:
-                                aligned_trace = np.concatenate([trace[-delay:], np.zeros(-delay)])
-                        else:
-                            aligned_trace = trace
+                        # 对齐波形
+                        aligned_traces = []
+                        valid_traces = []
+                        
+                        for trace_idx, delay_samples in enumerate(delays_samples):
+                            trace = depth_traces[trace_idx]
+                            delay_int = int(np.round(delay_samples))
                             
-                        coherent_trace += aligned_trace[:len(coherent_trace)]
+                            # 应用时延校正
+                            if delay_int > 0:
+                                if delay_int < len(trace):
+                                    aligned_trace = np.concatenate([np.zeros(delay_int), trace[:-delay_int]])
+                                else:
+                                    aligned_trace = np.zeros_like(trace)
+                            elif delay_int < 0:
+                                if abs(delay_int) < len(trace):
+                                    aligned_trace = np.concatenate([trace[-delay_int:], np.zeros(-delay_int)])
+                                else:
+                                    aligned_trace = np.zeros_like(trace)
+                            else:
+                                aligned_trace = trace.copy()
+                            
+                            aligned_traces.append(aligned_trace)
+                            valid_traces.append(trace_idx)
+                        
+                        if len(aligned_traces) >= 2:
+                            aligned_array = np.array(aligned_traces)
+                            
+                            # 计算Semblance
+                            semblance = self._calculate_semblance(aligned_array)
+                            
+                            # 更新最佳慢度
+                            if semblance > max_semblance:
+                                max_semblance = semblance
+                                optimal_slowness = slowness * 1e6  # 转换回µs/ft
+                                optimal_aligned_traces = aligned_array.copy()
                     
-                    coherent_trace /= len(depth_traces)
-                    coherent_wave[:, depth_idx] = coherent_trace
-                    
-                    # 计算局部慢度 - 使用稳健的线性回归方法
-                    slowness, r_squared = self._calculate_robust_slowness(depth_traces, receiver_spacing)
-                    local_slowness[i, depth_idx] = slowness
-                    quality_metrics[i, depth_idx] = r_squared
+                    # 使用最佳慢度进行相干叠加
+                    if optimal_aligned_traces is not None:
+                        coherent_trace = np.mean(optimal_aligned_traces, axis=0)
+                        coherent_wave[:, depth_idx] = coherent_trace
+                        best_slowness[i, depth_idx] = optimal_slowness
+                        semblance_quality[i, depth_idx] = max_semblance
+                    else:
+                        coherent_wave[:, depth_idx] = depth_traces[len(depth_traces)//2]
+                        best_slowness[i, depth_idx] = 0.0
+                        semblance_quality[i, depth_idx] = 0.0
                 else:
                     coherent_wave[:, depth_idx] = depth_traces[0]
-                    local_slowness[i, depth_idx] = 0.0
+                    best_slowness[i, depth_idx] = 0.0
+                    semblance_quality[i, depth_idx] = 0.0
             
             coherent_waveforms[receiver_id] = coherent_wave
         
-        logger.info("慢度-时间相干性分析完成")
-        return local_slowness, coherent_waveforms, quality_metrics
+        logger.info("改进的慢度-时间相干性分析完成")
+        return best_slowness, coherent_waveforms, semblance_quality
+    
+    def _calculate_semblance(self, aligned_traces: np.ndarray) -> float:
+        """
+        计算Semblance相干度量
+        
+        Args:
+            aligned_traces: 对齐后的波形数组 (n_traces, n_time)
+            
+        Returns:
+            Semblance值 (0-1之间，越高表示相干性越好)
+        """
+        n_traces, n_time = aligned_traces.shape
+        
+        if n_traces < 2:
+            return 0.0
+        
+        # 计算叠加波形的功率
+        stack_trace = np.sum(aligned_traces, axis=0)
+        stack_power = np.sum(stack_trace**2)
+        
+        # 计算单个波形功率之和
+        individual_power = np.sum(np.sum(aligned_traces**2, axis=1))
+        
+        # 计算Semblance
+        if individual_power > 1e-10:
+            semblance = stack_power / (n_traces * individual_power)
+            return min(1.0, max(0.0, semblance))  # 限制在[0,1]范围
+        else:
+            return 0.0
     
     def calculate_attenuation(self, waveforms: Dict) -> np.ndarray:
         """

@@ -1,295 +1,427 @@
 """
-特征工程模块 - 生成机器学习训练所需的特征和标签
+特征工程模块 - 支持HDF5增量存储的大规模数据处理
 """
 import numpy as np
-from typing import Dict, Tuple, List
+from typing import Dict, List, Tuple, Optional
 import logging
+from pathlib import Path
+import gc
+
 from .signal_processing import SignalProcessor
+from .data_loader import DataLoader
+from .hdf5_manager import HDF5DataManager, BatchProcessor
 
 logger = logging.getLogger(__name__)
 
-class FeatureEngineer:
-    """特征工程器"""
+class IncrementalFeatureEngineer:
+    """增量特征工程器 - 使用HDF5进行内存高效的特征处理"""
     
-    def __init__(self):
+    def __init__(self, 
+                 depth_range: Tuple[float, float] = (2850.0, 2950.0),  # 调整为100ft范围
+                 azimuth_sectors: int = 8,
+                 batch_size: int = 50):
+        """
+        初始化增量特征工程器
+        
+        Args:
+            depth_range: 深度范围 (ft)
+            azimuth_sectors: 方位角扇区数
+            batch_size: 批处理大小
+        """
+        self.depth_range = depth_range
+        self.azimuth_sectors = azimuth_sectors
+        self.batch_size = batch_size
+        
+        # 初始化组件
+        self.data_loader = DataLoader()
         self.signal_processor = SignalProcessor()
         
-        # 方位接收器到角度的映射 (45度扇区)
-        self.azimuth_mapping = {
-            'A': (-22.5, 22.5),     # 0度
-            'B': (22.5, 67.5),     # 45度
-            'C': (67.5, 112.5),    # 90度
-            'D': (112.5, 157.5),   # 135度
-            'E': (157.5, 202.5),   # 180度
-            'F': (202.5, 247.5),   # 225度
-            'G': (247.5, 292.5),   # 270度
-            'H': (292.5, 337.5)    # 315度
-        }
+        # 方位角扇区划分 (360度/8扇区 = 45度每扇区)
+        self.sector_size = 360 // self.azimuth_sectors
         
-        # 将负角度转换为正角度
-        for side in self.azimuth_mapping:
-            min_angle, max_angle = self.azimuth_mapping[side]
-            if min_angle < 0:
-                min_angle += 360
-            if max_angle < 0:
-                max_angle += 360
-            self.azimuth_mapping[side] = (min_angle, max_angle)
+        logger.info(f"初始化增量特征工程器:")
+        logger.info(f"  深度范围: {depth_range[0]:.1f}-{depth_range[1]:.1f} ft")
+        logger.info(f"  方位角扇区: {azimuth_sectors} 个")
+        logger.info(f"  批处理大小: {batch_size}")
     
-    def generate_training_data(self, cast_data: Dict, xsilmr_data: Dict) -> Tuple[List, List, List]:
+    def estimate_total_samples(self) -> int:
         """
-        生成训练数据
+        估算总样本数，用于初始化HDF5数据集
+        """
+        logger.info("估算总样本数...")
+        
+        # 加载CAST数据获取深度信息
+        cast_data = self.data_loader.load_cast_data()
+        depths = cast_data['Depth']
+        
+        # 筛选深度范围
+        depth_mask = (depths >= self.depth_range[0]) & (depths <= self.depth_range[1])
+        n_depths = np.sum(depth_mask)
+        
+        # 估算总样本数: 深度点数 × 接收器数 × 方位角扇区数
+        n_receivers = 13  # XSILMR有13个接收器
+        total_samples = n_depths * n_receivers * self.azimuth_sectors
+        
+        logger.info(f"估算结果:")
+        logger.info(f"  筛选深度点数: {n_depths}")
+        logger.info(f"  接收器数: {n_receivers}")
+        logger.info(f"  方位角扇区数: {self.azimuth_sectors}")
+        logger.info(f"  预估总样本数: {total_samples}")
+        
+        return total_samples
+    
+    def generate_features_to_hdf5(self, hdf5_path: str = "data/processed/features.h5") -> int:
+        """
+        生成特征并增量存储到HDF5文件
         
         Args:
-            cast_data: CAST超声数据
-            xsilmr_data: XSILMR声波数据
+            hdf5_path: HDF5文件路径
             
         Returns:
-            特征列表(图像), 特征列表(数值), 标签列表
+            实际生成的样本数
         """
-        logger.info("开始生成训练数据...")
+        logger.info("开始增量特征工程处理...")
         
-        X_images = []  # 尺度图特征
-        X_vectors = []  # 数值特征
-        y_labels = []   # 窜槽比例标签
+        # 1. 估算总样本数
+        total_samples = self.estimate_total_samples()
         
-        # 遍历所有接收器和方位
-        for receiver_idx in sorted(xsilmr_data.keys()):
-            receiver_data = xsilmr_data[receiver_idx]
-            absolute_depths = receiver_data['AbsoluteDepth']
+        # 2. 创建HDF5管理器和批处理器
+        hdf5_manager = HDF5DataManager(hdf5_path, mode='w')
+        hdf5_manager.create_dataset_structure(
+            total_samples=total_samples,
+            image_shape=(127, 1024),
+            vector_dim=8,
+            chunk_size=100
+        )
+        
+        batch_processor = BatchProcessor(hdf5_manager, batch_size=self.batch_size)
+        
+        try:
+            # 3. 加载基础数据
+            logger.info("加载基础数据...")
+            cast_data = self.data_loader.load_cast_data()
+            xsilmr_data = self.data_loader.load_xsilmr_data()
             
-            logger.info(f"处理接收器 {receiver_idx}...")
+            # 4. 筛选深度范围
+            filtered_cast, filtered_xsilmr = self.data_loader.filter_depth_range(
+                min_depth=self.depth_range[0],
+                max_depth=self.depth_range[1]
+            )
             
-            for side in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
-                side_key = f'Side{side}'
-                if side_key not in receiver_data:
-                    continue
+            # 5. 计算绝对深度
+            filtered_xsilmr = self.data_loader.calculate_absolute_depths(filtered_xsilmr)
+            
+            logger.info(f"筛选后数据:")
+            logger.info(f"  CAST深度点数: {len(filtered_cast['Depth'])}")
+            logger.info(f"  XSILMR深度点数: {len(filtered_xsilmr[7]['Depth'])}")
+            
+            # 6. 开始分块处理
+            sample_id = 0
+            
+            # 按接收器处理
+            for receiver_id in sorted(filtered_xsilmr.keys()):
+                logger.info(f"处理接收器 {receiver_id}...")
+                receiver_data = filtered_xsilmr[receiver_id]
                 
-                waveforms = receiver_data[side_key]  # (1024, n_depth)
-                n_time, n_depth = waveforms.shape
-                
-                # 应用高通滤波
-                filtered_waveforms = self.signal_processor.apply_highpass_filter(waveforms)
-                
-                # 为每个深度点生成特征和标签
-                actual_depth_count = min(n_depth, len(absolute_depths))
-                for depth_idx in range(actual_depth_count):
-                    depth_value = absolute_depths[depth_idx]
-                    waveform = filtered_waveforms[:, depth_idx]
+                # 按方位角扇区处理
+                for sector_idx in range(self.azimuth_sectors):
+                    logger.info(f"  处理方位角扇区 {sector_idx + 1}/{self.azimuth_sectors}")
                     
-                    # 生成图像特征 (尺度图)
-                    scalogram = self.signal_processor.generate_scalogram(waveform)
-                    X_images.append(scalogram)
+                    # 获取扇区内的方位角数据
+                    sector_cast_data = self._get_sector_cast_data(
+                        filtered_cast, sector_idx
+                    )
                     
-                    # 生成数值特征
-                    physical_features = self.signal_processor.extract_physical_features(waveform)
-                    feature_vector = self._dict_to_vector(physical_features)
-                    X_vectors.append(feature_vector)
+                    # 获取XSILMR方位角数据
+                    side_key = self._get_side_key(sector_idx)
+                    if side_key not in receiver_data:
+                        logger.warning(f"接收器 {receiver_id} 缺少 {side_key} 数据")
+                        continue
                     
-                    # 生成标签 (窜槽比例)
-                    channeling_ratio = self._calculate_channeling_ratio(
-                        cast_data, depth_value, side)
-                    y_labels.append(channeling_ratio)
+                    xsilmr_waves = receiver_data[side_key]
+                    depths = receiver_data['AbsoluteDepth']
                     
-                if len(X_images) % 1000 == 0:
-                    logger.info(f"已处理 {len(X_images)} 个样本...")
-        
-        logger.info(f"训练数据生成完成: 共 {len(X_images)} 个样本")
-        return X_images, X_vectors, y_labels
+                    # 逐深度点处理
+                    self._process_depth_points(
+                        xsilmr_waves, depths, sector_cast_data,
+                        receiver_id, sector_idx, sample_id,
+                        batch_processor
+                    )
+                    
+                    # 强制垃圾回收
+                    gc.collect()
+                    
+                sample_id += len(depths) if 'depths' in locals() else 0
+            
+            # 7. 完成处理
+            actual_samples = batch_processor.finalize()
+            
+            # 8. 导出摘要
+            hdf5_manager.mode = 'r'  # 切换到读模式
+            hdf5_manager.export_summary()
+            
+            logger.info(f"增量特征工程完成!")
+            logger.info(f"实际生成样本数: {actual_samples}")
+            logger.info(f"HDF5文件: {hdf5_path}")
+            
+            return actual_samples
+            
+        except Exception as e:
+            logger.error(f"特征工程过程中发生错误: {e}")
+            raise
+        finally:
+            # 清理资源
+            del batch_processor
+            del hdf5_manager
+            gc.collect()
     
-    def generate_enhanced_training_data(self, cast_data: Dict, xsilmr_data: Dict) -> Tuple[List, List, List]:
+    def _get_sector_cast_data(self, cast_data: Dict, sector_idx: int) -> np.ndarray:
         """
-        生成增强版训练数据 (使用阵列信号处理)
+        获取指定扇区的CAST数据
         
         Args:
-            cast_data: CAST超声数据
-            xsilmr_data: XSILMR声波数据
+            cast_data: CAST数据字典
+            sector_idx: 扇区索引 (0-7)
             
         Returns:
-            特征列表(图像), 特征列表(数值), 标签列表
+            扇区CAST数据 (n_depths,)
         """
-        logger.info("开始生成增强版训练数据...")
+        zc_data = cast_data['Zc']  # 形状: (180, n_depths)
         
-        X_images = []
-        X_vectors = []
-        y_labels = []
+        # 计算扇区的方位角范围
+        start_angle = sector_idx * self.sector_size
+        end_angle = (sector_idx + 1) * self.sector_size
         
-        # 为每个方位角分别处理
-        for side in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
-            logger.info(f"处理方位 {side}...")
+        # 获取扇区内的方位角索引 (每2度一个方位角)
+        start_idx = start_angle // 2
+        end_idx = end_angle // 2
+        
+        # 计算扇区内的平均窜槽比例
+        sector_zc = zc_data[start_idx:end_idx, :]  # (sector_azimuths, n_depths)
+        
+        # 计算每个深度点的窜槽比例 (Zc < 2.5 为窜槽)
+        channeling_mask = sector_zc < 2.5
+        channeling_ratios = np.mean(channeling_mask, axis=0)  # (n_depths,)
+        
+        return channeling_ratios
+    
+    def _get_side_key(self, sector_idx: int) -> str:
+        """根据扇区索引获取对应的方位键"""
+        sides = ['SideA', 'SideB', 'SideC', 'SideD', 
+                'SideE', 'SideF', 'SideG', 'SideH']
+        return sides[sector_idx]
+    
+    def _process_depth_points(self, 
+                            xsilmr_waves: np.ndarray,
+                            depths: np.ndarray,
+                            cast_ratios: np.ndarray,
+                            receiver_id: int,
+                            sector_idx: int,
+                            base_sample_id: int,
+                            batch_processor: BatchProcessor):
+        """
+        处理单个接收器-方位角组合的所有深度点
+        
+        Args:
+            xsilmr_waves: XSILMR波形数据 (1024, n_depths)
+            depths: 深度数组
+            cast_ratios: CAST窜槽比例数组
+            receiver_id: 接收器ID
+            sector_idx: 扇区索引
+            base_sample_id: 基础样本ID
+            batch_processor: 批处理器
+        """
+        n_time, n_depths = xsilmr_waves.shape
+        
+        for depth_idx in range(n_depths):
+            if depth_idx % 100 == 0:
+                logger.debug(f"    处理深度点 {depth_idx}/{n_depths}")
             
-            # 收集该方位角下所有接收器的波形
-            side_waveforms = {}
-            common_depths = None
+            # 提取单个深度点的波形
+            waveform = xsilmr_waves[:, depth_idx]  # (1024,)
             
-            for receiver_idx in sorted(xsilmr_data.keys()):
-                receiver_data = xsilmr_data[receiver_idx]
-                side_key = f'Side{side}'
+            try:
+                # 1. 信号处理
+                filtered_waveform = self.signal_processor.apply_highpass_filter(waveform)
                 
-                if side_key in receiver_data:
-                    waveforms = receiver_data[side_key]
-                    filtered_waveforms = self.signal_processor.apply_highpass_filter(waveforms)
-                    side_waveforms[receiver_idx] = filtered_waveforms
-                    
-                    if common_depths is None:
-                        common_depths = receiver_data['AbsoluteDepth']
-            
-            if len(side_waveforms) < 2:
-                logger.warning(f"方位 {side} 的接收器数量不足，跳过")
+                # 2. 生成尺度图 (图像特征)
+                scalogram = self.signal_processor.generate_scalogram(filtered_waveform)
+                
+                # 3. 提取物理特征 (数值特征)
+                physical_features = self.signal_processor.extract_physical_features(filtered_waveform)
+                
+                # 转换为特征向量
+                vector_features = np.array([
+                    physical_features['max_amplitude'],
+                    physical_features['rms_amplitude'],
+                    physical_features['energy'],
+                    physical_features['zero_crossings'],
+                    physical_features['dominant_frequency'],
+                    physical_features['spectral_centroid'],
+                    receiver_id,  # 接收器ID作为特征
+                    sector_idx    # 方位角扇区作为特征
+                ], dtype=np.float32)
+                
+                # 4. 获取标签 (窜槽比例)
+                label = cast_ratios[depth_idx]
+                
+                # 5. 元数据
+                metadata = (
+                    depths[depth_idx],  # depth
+                    receiver_id,        # receiver_id
+                    sector_idx,         # azimuth_sector
+                    base_sample_id + depth_idx  # sample_id
+                )
+                
+                # 6. 添加到批处理器
+                batch_processor.add_sample(
+                    image_feature=scalogram,
+                    vector_feature=vector_features,
+                    label=label,
+                    metadata=metadata
+                )
+                
+            except Exception as e:
+                logger.warning(f"处理深度点 {depth_idx} 时出错: {e}")
                 continue
-            
-            # 执行慢度-时间相干性分析
-            local_slowness, coherent_waveforms, quality_metrics = self.signal_processor.slowness_time_coherence(
-                side_waveforms)
-            
-            # 计算衰减率
-            attenuation = self.signal_processor.calculate_attenuation(coherent_waveforms)
-            
-            # 为每个接收器的每个深度点生成特征
-            for receiver_idx in sorted(coherent_waveforms.keys()):
-                coherent_wave = coherent_waveforms[receiver_idx]
-                n_time, n_depth = coherent_wave.shape
-                
-                actual_depth_count = min(n_depth, len(common_depths))
-                for depth_idx in range(actual_depth_count):
-                    depth_value = common_depths[depth_idx]
-                    waveform = coherent_wave[:, depth_idx]
-                    
-                    # 图像特征 (基于相干滤波后的波形)
-                    scalogram = self.signal_processor.generate_scalogram(waveform)
-                    X_images.append(scalogram)
-                    
-                    # 数值特征 (物理特征 + 慢度 + 衰减率)
-                    physical_features = self.signal_processor.extract_physical_features(waveform)
-                    
-                    # 添加慢度特征
-                    receiver_list = sorted(side_waveforms.keys())
-                    if receiver_idx in receiver_list:
-                        r_idx = receiver_list.index(receiver_idx)
-                        if r_idx < local_slowness.shape[0]:
-                            physical_features['local_slowness'] = local_slowness[r_idx, depth_idx]
-                        else:
-                            physical_features['local_slowness'] = 0.0
-                    else:
-                        physical_features['local_slowness'] = 0.0
-                    
-                    # 添加衰减率特征
-                    if r_idx < attenuation.shape[0]:
-                        physical_features['attenuation_rate'] = attenuation[r_idx, depth_idx]
-                    else:
-                        physical_features['attenuation_rate'] = 0.0
-                    
-                    feature_vector = self._dict_to_vector(physical_features)
-                    X_vectors.append(feature_vector)
-                    
-                    # 生成标签
-                    channeling_ratio = self._calculate_channeling_ratio(
-                        cast_data, depth_value, side)
-                    y_labels.append(channeling_ratio)
-                    
-                if len(X_images) % 1000 == 0:
-                    logger.info(f"已处理 {len(X_images)} 个样本...")
-        
-        logger.info(f"增强版训练数据生成完成: 共 {len(X_images)} 个样本")
-        return X_images, X_vectors, y_labels
+
+
+class FeatureEngineer:
+    """
+    传统特征工程器 (兼容性保持)
+    注意: 此类保留是为了兼容性，建议使用 IncrementalFeatureEngineer
+    """
     
-    def _calculate_channeling_ratio(self, cast_data: Dict, depth: float, side: str) -> float:
+    def __init__(self, depth_range: Tuple[float, float] = (2850.0, 2950.0)):
         """
-        计算指定深度和方位的窜槽比例
+        初始化特征工程器
         
         Args:
-            cast_data: CAST数据
-            depth: 深度值
-            side: 方位接收器标识
-            
-        Returns:
-            窜槽比例 (0-1)
+            depth_range: 分析深度范围 (ft) - 调整为较小范围
         """
-        # 获取方位角范围
-        if side not in self.azimuth_mapping:
-            return 0.0
+        self.depth_range = depth_range
+        self.data_loader = DataLoader()
+        self.signal_processor = SignalProcessor()
         
-        min_angle, max_angle = self.azimuth_mapping[side]
+        logger.warning("使用传统FeatureEngineer可能导致内存不足")
+        logger.warning("建议使用IncrementalFeatureEngineer进行大规模数据处理")
         
-        # 定义深度窗口 (±0.25 ft)
-        depth_window = 0.25
-        depth_mask = (cast_data['Depth'] >= depth - depth_window) & \
-                    (cast_data['Depth'] <= depth + depth_window)
-        
-        if not np.any(depth_mask):
-            return 0.0
-        
-        # CAST数据的角度索引 (每2度一个，共180个)
-        angles = np.arange(0, 360, 2)  # 0, 2, 4, ..., 358
-        
-        # 处理跨越0度的情况
-        if min_angle > max_angle:  # 跨越0度
-            angle_mask = (angles >= min_angle) | (angles <= max_angle)
-        else:
-            angle_mask = (angles >= min_angle) & (angles <= max_angle)
-        
-        # 提取对应区域的Zc值
-        zc_region = cast_data['Zc'][angle_mask, :][:, depth_mask]
-        
-        if zc_region.size == 0:
-            return 0.0
-        
-        # 计算窜槽比例 (Zc < 2.5 的比例)
-        channeling_points = np.sum(zc_region < 2.5)
-        total_points = zc_region.size
-        
-        return channeling_points / total_points if total_points > 0 else 0.0
-    
-    def _dict_to_vector(self, feature_dict: Dict) -> np.ndarray:
+    def generate_training_data(self, target_receiver: int = 7, 
+                             max_samples: int = 200) -> Tuple:
         """
-        将特征字典转换为向量
+        生成训练数据 (限制样本数以控制内存使用)
         
         Args:
-            feature_dict: 特征字典
+            target_receiver: 目标接收器
+            max_samples: 最大样本数
             
         Returns:
-            特征向量
+            图像特征, 数值特征, 标签
         """
-        # 定义特征顺序
-        feature_order = [
-            'max_amplitude', 'rms_amplitude', 'energy', 'zero_crossings',
-            'dominant_frequency', 'spectral_centroid', 'local_slowness', 'attenuation_rate'
-        ]
+        logger.info("生成训练数据 (传统方法，限制样本数)...")
+        logger.warning(f"样本数限制为 {max_samples} 以控制内存使用")
         
-        vector = []
-        for feature_name in feature_order:
-            if feature_name in feature_dict:
-                value = feature_dict[feature_name]
-                # 处理可能的无穷大或NaN值
-                if np.isfinite(value):
-                    vector.append(float(value))
-                else:
-                    vector.append(0.0)
-            else:
-                vector.append(0.0)
+        # 加载数据
+        cast_data = self.data_loader.load_cast_data()
+        xsilmr_data = self.data_loader.load_xsilmr_data()
         
-        return np.array(vector)
+        # 筛选深度范围
+        filtered_cast, filtered_xsilmr = self.data_loader.filter_depth_range(
+            min_depth=self.depth_range[0],
+            max_depth=self.depth_range[1]
+        )
+        
+        # 计算绝对深度
+        filtered_xsilmr = self.data_loader.calculate_absolute_depths(filtered_xsilmr)
+        
+        if target_receiver not in filtered_xsilmr:
+            raise ValueError(f"目标接收器 {target_receiver} 不存在")
+        
+        # 获取目标接收器数据
+        receiver_data = filtered_xsilmr[target_receiver]
+        xsilmr_depths = receiver_data['AbsoluteDepth']
+        cast_depths = filtered_cast['Depth']
+        cast_zc = filtered_cast['Zc']
+        
+        # 准备存储
+        image_features = []
+        vector_features = []
+        labels = []
+        
+        sample_count = 0
+        
+        # 处理方位A的数据
+        if 'SideA' in receiver_data:
+            waveforms = receiver_data['SideA']  # (1024, n_depths)
+            
+            # 创建方位角窜槽标签
+            azimuth_range = (0, 45)  # 方位A对应0-45度
+            sector_labels = self._create_azimuth_labels(
+                cast_depths, cast_zc, xsilmr_depths, azimuth_range
+            )
+            
+            # 处理波形数据
+            n_depths = min(waveforms.shape[1], len(sector_labels), max_samples)
+            
+            for i in range(n_depths):
+                try:
+                    waveform = waveforms[:, i]
+                    
+                    # 应用高通滤波
+                    filtered_waveform = self.signal_processor.apply_highpass_filter(waveform)
+                    
+                    # 生成尺度图
+                    scalogram = self.signal_processor.generate_scalogram(filtered_waveform)
+                    
+                    # 提取物理特征
+                    features = self.signal_processor.extract_physical_features(filtered_waveform)
+                    
+                    # 创建特征向量
+                    feature_vector = np.array([
+                        features['max_amplitude'],
+                        features['rms_amplitude'],
+                        features['energy'],
+                        features['zero_crossings'],
+                        features['dominant_frequency'],
+                        features['spectral_centroid'],
+                        target_receiver,
+                        0  # 方位A的索引
+                    ])
+                    
+                    image_features.append(scalogram)
+                    vector_features.append(feature_vector)
+                    labels.append(sector_labels[i])
+                    
+                    sample_count += 1
+                    
+                    if sample_count >= max_samples:
+                        break
+                        
+                except Exception as e:
+                    logger.warning(f"处理样本 {i} 时出错: {e}")
+                    continue
+        
+        logger.info(f"传统特征工程完成: 生成 {len(image_features)} 个样本")
+        
+        return np.array(image_features), np.array(vector_features), np.array(labels)
     
-    def prepare_new_data(self, waveform: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        为新数据准备特征 (用于可逆应用)
+    def _create_azimuth_labels(self, cast_depths: np.ndarray, cast_zc: np.ndarray,
+                             xsilmr_depths: np.ndarray, azimuth_range: Tuple[int, int]) -> np.ndarray:
+        """创建方位角标签"""
+        start_angle, end_angle = azimuth_range
         
-        Args:
-            waveform: 新的波形数据
-            
-        Returns:
-            图像特征, 数值特征
-        """
-        # 应用相同的预处理
-        filtered_waveform = self.signal_processor.apply_highpass_filter(waveform)
+        # 方位角索引 (每2度一个)
+        start_idx = start_angle // 2
+        end_idx = end_angle // 2
         
-        # 生成特征
-        scalogram = self.signal_processor.generate_scalogram(filtered_waveform)
-        physical_features = self.signal_processor.extract_physical_features(filtered_waveform)
+        # 获取方位角范围内的数据
+        azimuth_zc = cast_zc[start_idx:end_idx, :]  # (n_azimuths, n_depths)
         
-        # 对于新数据，慢度和衰减率设为0（需要阵列数据才能计算）
-        physical_features['local_slowness'] = 0.0
-        physical_features['attenuation_rate'] = 0.0
+        # 计算窜槽比例
+        channeling_mask = azimuth_zc < 2.5
+        channeling_ratios = np.mean(channeling_mask, axis=0)  # (n_depths,)
         
-        feature_vector = self._dict_to_vector(physical_features)
+        # 插值到XSILMR深度
+        interpolated_ratios = np.interp(xsilmr_depths, cast_depths, channeling_ratios)
         
-        return scalogram, feature_vector 
+        return interpolated_ratios 
