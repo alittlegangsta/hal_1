@@ -2,6 +2,7 @@
 numpy>=1.21.0
 pandas>=1.4.0
 scipy>=1.9.0
+h5py>=3.7.0
 
 # Machine Learning Framework
 tensorflow==2.12.0

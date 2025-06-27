@@ -73,7 +73,7 @@ class DataLoader:
         logger.info(f"XSILMR数据加载完成: 共{len(self.xsilmr_data)}个接收器")
         return self.xsilmr_data
     
-    def filter_depth_range(self, min_depth: float = 2732.0, max_depth: float = 4132.0) -> Tuple[Dict, Dict]:
+    def filter_depth_range(self, min_depth: float = 2850.0, max_depth: float = 2950.0) -> Tuple[Dict, Dict]:
         """筛选指定深度范围的数据"""
         logger.info(f"筛选深度范围: {min_depth} - {max_depth} ft")
         

@@ -1,46 +1,49 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-HDF5数据管理器 - 用于大规模测井数据的增量存储和高效读取
+HDF5数据管理器 - 支持大规模数据的增量存储和高效读取
 """
-
 import h5py
 import numpy as np
-from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 import logging
-from contextlib import contextmanager
+from pathlib import Path
+import gc
+import json
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 class HDF5DataManager:
-    """HDF5数据管理器 - 支持增量写入和高效读取"""
+    """HDF5数据集管理器 - 支持大规模数据的增量存储"""
     
-    def __init__(self, file_path: str, mode: str = 'w'):
+    def __init__(self, filepath: str, mode: str = 'w'):
         """
         初始化HDF5数据管理器
         
         Args:
-            file_path: HDF5文件路径
-            mode: 文件打开模式 ('w': 写, 'r': 读, 'a': 追加)
+            filepath: HDF5文件路径
+            mode: 文件打开模式 ('w', 'r', 'a')
         """
-        self.file_path = Path(file_path)
+        self.filepath = Path(filepath)
         self.mode = mode
-        self.file_handle = None
+        self.file = None
+        self.datasets = {}
         
         # 确保目录存在
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
         
-    @contextmanager
-    def open_file(self):
-        """上下文管理器，安全地打开和关闭HDF5文件"""
+        # 打开文件
+        self._open_file()
+        
+        logger.info(f"HDF5数据管理器初始化: {self.filepath}, 模式: {mode}")
+    
+    def _open_file(self):
+        """打开HDF5文件"""
         try:
-            self.file_handle = h5py.File(self.file_path, self.mode)
-            yield self.file_handle
-        finally:
-            if self.file_handle is not None:
-                self.file_handle.close()
-                self.file_handle = None
+            self.file = h5py.File(str(self.filepath), self.mode)
+            logger.debug(f"HDF5文件已打开: {self.filepath}")
+        except Exception as e:
+            logger.error(f"无法打开HDF5文件 {self.filepath}: {e}")
+            raise
     
     def create_dataset_structure(self, 
                                total_samples: int,
@@ -48,384 +51,446 @@ class HDF5DataManager:
                                vector_dim: int = 8,
                                chunk_size: int = 100):
         """
-        创建HDF5数据集结构
+        创建数据集结构
         
         Args:
-            total_samples: 预期的总样本数
+            total_samples: 预估总样本数
             image_shape: 图像特征形状
-            vector_dim: 数值特征维度
-            chunk_size: 数据块大小，用于优化I/O性能
+            vector_dim: 向量特征维度
+            chunk_size: 分块大小
         """
-        logger.info(f"创建HDF5数据集结构: {self.file_path}")
-        logger.info(f"预期样本数: {total_samples}, 图像形状: {image_shape}, 向量维度: {vector_dim}")
+        if self.mode == 'r':
+            raise ValueError("只读模式下无法创建数据集")
         
-        # 调整chunk_size以确保不超过总样本数
-        actual_chunk_size = min(chunk_size, total_samples)
-        if actual_chunk_size != chunk_size:
-            logger.info(f"调整chunk_size: {chunk_size} -> {actual_chunk_size} (不能超过总样本数)")
+        logger.info(f"创建HDF5数据集结构:")
+        logger.info(f"  总样本数: {total_samples}")
+        logger.info(f"  图像形状: {image_shape}")
+        logger.info(f"  向量维度: {vector_dim}")
+        logger.info(f"  分块大小: {chunk_size}")
         
-        with self.open_file() as f:
-            # 创建数据集 - 使用gzip压缩节省空间
-            
-            # 图像特征数据集 (scalograms)
-            f.create_dataset(
-                'image_features',
-                shape=(total_samples, *image_shape),
-                dtype=np.float32,
-                chunks=(actual_chunk_size, *image_shape),
-                compression='gzip',
-                compression_opts=6,
-                shuffle=True  # 重排数据以提高压缩率
-            )
-            
-            # 数值特征数据集
-            f.create_dataset(
-                'vector_features',
-                shape=(total_samples, vector_dim),
-                dtype=np.float32,
-                chunks=(actual_chunk_size, vector_dim),
-                compression='gzip',
-                compression_opts=6,
-                shuffle=True
-            )
-            
-            # 标签数据集
-            f.create_dataset(
-                'labels',
-                shape=(total_samples,),
-                dtype=np.float32,
-                chunks=(actual_chunk_size,),
-                compression='gzip',
-                compression_opts=6
-            )
-            
-            # 元数据数据集 - 存储深度、接收器、方位角等信息
-            f.create_dataset(
-                'metadata',
-                shape=(total_samples,),
-                dtype=[
-                    ('depth', 'f4'),
-                    ('receiver_id', 'i4'),
-                    ('azimuth_sector', 'i4'),
-                    ('sample_id', 'i4')
-                ],
-                chunks=(actual_chunk_size,),
-                compression='gzip',
-                compression_opts=6
-            )
-            
-            # 添加属性信息
-            f.attrs['total_samples'] = total_samples
-            f.attrs['image_shape'] = image_shape
-            f.attrs['vector_dim'] = vector_dim
-            f.attrs['chunk_size'] = actual_chunk_size
-            f.attrs['created_by'] = 'HAL Well Logging Analysis'
-            
+        # 图像特征数据集
+        self.datasets['images'] = self.file.create_dataset(
+            'images',
+            shape=(total_samples, *image_shape),
+            dtype=np.float32,
+            chunks=(chunk_size, *image_shape),
+            compression='gzip',
+            compression_opts=6,
+            maxshape=(None, *image_shape)  # 允许动态扩展
+        )
+        
+        # 向量特征数据集
+        self.datasets['vectors'] = self.file.create_dataset(
+            'vectors',
+            shape=(total_samples, vector_dim),
+            dtype=np.float32,
+            chunks=(chunk_size, vector_dim),
+            compression='gzip',
+            compression_opts=6,
+            maxshape=(None, vector_dim)
+        )
+        
+        # 标签数据集
+        self.datasets['labels'] = self.file.create_dataset(
+            'labels',
+            shape=(total_samples,),
+            dtype=np.float32,
+            chunks=(chunk_size,),
+            compression='gzip',
+            compression_opts=6,
+            maxshape=(None,)
+        )
+        
+        # 元数据数据集
+        self.datasets['metadata'] = self.file.create_dataset(
+            'metadata',
+            shape=(total_samples, 4),  # depth, receiver_id, azimuth_sector, sample_id
+            dtype=np.float32,
+            chunks=(chunk_size, 4),
+            compression='gzip',
+            compression_opts=6,
+            maxshape=(None, 4)
+        )
+        
+        # 存储数据集描述信息
+        self._save_dataset_info(total_samples, image_shape, vector_dim, chunk_size)
+        
         logger.info("HDF5数据集结构创建完成")
+    
+    def _save_dataset_info(self, total_samples: int, image_shape: Tuple, 
+                          vector_dim: int, chunk_size: int):
+        """保存数据集描述信息"""
+        info = {
+            'total_samples': total_samples,
+            'image_shape': image_shape,
+            'vector_dim': vector_dim,
+            'chunk_size': chunk_size,
+            'created_time': datetime.now().isoformat(),
+            'version': '1.0'
+        }
+        
+        # 将信息存储为HDF5属性
+        for key, value in info.items():
+            if isinstance(value, (list, tuple)):
+                self.file.attrs[key] = json.dumps(value)
+            else:
+                self.file.attrs[key] = str(value)
     
     def write_batch(self, 
                    start_idx: int,
-                   image_features: np.ndarray,
-                   vector_features: np.ndarray,
+                   images: np.ndarray,
+                   vectors: np.ndarray,
                    labels: np.ndarray,
-                   metadata: Optional[np.ndarray] = None):
+                   metadata: np.ndarray):
         """
-        批量写入数据到HDF5文件
+        批量写入数据
         
         Args:
             start_idx: 起始索引
-            image_features: 图像特征数组
-            vector_features: 数值特征数组
-            labels: 标签数组
-            metadata: 元数据数组 (可选)
+            images: 图像特征数组 (batch_size, height, width)
+            vectors: 向量特征数组 (batch_size, vector_dim)
+            labels: 标签数组 (batch_size,)
+            metadata: 元数据数组 (batch_size, 4)
         """
-        batch_size = len(image_features)
+        if self.mode == 'r':
+            raise ValueError("只读模式下无法写入数据")
+        
+        batch_size = len(images)
         end_idx = start_idx + batch_size
-        
-        logger.debug(f"写入批次 [{start_idx}:{end_idx}], 大小: {batch_size}")
-        
-        # 确保文件是以写入模式打开
-        current_mode = self.mode
-        self.mode = 'r+' if current_mode == 'r' else 'a'
         
         try:
-            with self.open_file() as f:
-                # 写入图像特征
-                f['image_features'][start_idx:end_idx] = image_features.astype(np.float32)
-                
-                # 写入数值特征
-                f['vector_features'][start_idx:end_idx] = vector_features.astype(np.float32)
-                
-                # 写入标签
-                f['labels'][start_idx:end_idx] = labels.astype(np.float32)
-                
-                # 写入元数据 (如果提供)
-                if metadata is not None:
-                    f['metadata'][start_idx:end_idx] = metadata
-                
-                # 刷新缓冲区，确保数据写入磁盘
-                f.flush()
+            # 检查是否需要扩展数据集
+            current_size = self.datasets['images'].shape[0]
+            if end_idx > current_size:
+                new_size = max(end_idx, current_size + batch_size)
+                self._resize_datasets(new_size)
+            
+            # 写入数据
+            self.datasets['images'][start_idx:end_idx] = images
+            self.datasets['vectors'][start_idx:end_idx] = vectors
+            self.datasets['labels'][start_idx:end_idx] = labels
+            self.datasets['metadata'][start_idx:end_idx] = metadata
+            
+            # 强制写入磁盘
+            self.file.flush()
+            
+            logger.debug(f"批量数据写入完成: 索引 {start_idx}-{end_idx-1}")
+            
         except Exception as e:
-            logger.error(f"写入批次数据时出错: {e}")
+            logger.error(f"批量写入数据失败: {e}")
             raise
-        finally:
-            # 恢复原始模式
-            self.mode = current_mode
     
-    def read_batch(self, start_idx: int, batch_size: int) -> Dict[str, np.ndarray]:
+    def _resize_datasets(self, new_size: int):
+        """扩展数据集大小"""
+        logger.info(f"扩展数据集大小到: {new_size}")
+        
+        for name, dataset in self.datasets.items():
+            if name == 'metadata':
+                dataset.resize((new_size, 4))
+            elif name in ['labels']:
+                dataset.resize((new_size,))
+            elif name == 'vectors':
+                current_vector_dim = dataset.shape[1]
+                dataset.resize((new_size, current_vector_dim))
+            elif name == 'images':
+                current_shape = dataset.shape[1:]
+                dataset.resize((new_size, *current_shape))
+    
+    def read_batch(self, start_idx: int, batch_size: int) -> Tuple:
         """
-        从HDF5文件读取批次数据
+        批量读取数据
         
         Args:
             start_idx: 起始索引
-            batch_size: 批次大小
+            batch_size: 批大小
             
         Returns:
-            包含各类特征数据的字典
+            图像特征, 向量特征, 标签, 元数据
         """
-        end_idx = start_idx + batch_size
+        if self.mode == 'w':
+            logger.warning("写模式下读取数据，切换到追加模式")
+            self.file.close()
+            self.mode = 'a'
+            self._open_file()
+            self._load_existing_datasets()
         
-        with self.open_file() as f:
-            data = {
-                'image_features': f['image_features'][start_idx:end_idx],
-                'vector_features': f['vector_features'][start_idx:end_idx],
-                'labels': f['labels'][start_idx:end_idx]
-            }
-            
-            # 读取元数据 (如果存在)
-            if 'metadata' in f:
-                data['metadata'] = f['metadata'][start_idx:end_idx]
-                
-        return data
+        end_idx = min(start_idx + batch_size, self.get_total_samples())
+        
+        images = self.datasets['images'][start_idx:end_idx]
+        vectors = self.datasets['vectors'][start_idx:end_idx]
+        labels = self.datasets['labels'][start_idx:end_idx]
+        metadata = self.datasets['metadata'][start_idx:end_idx]
+        
+        return images, vectors, labels, metadata
     
-    def read_all_data(self) -> Dict[str, np.ndarray]:
-        """
-        读取所有数据 (小心使用，可能消耗大量内存)
-        
-        Returns:
-            包含所有数据的字典
-        """
-        logger.warning("读取所有数据到内存，请确保有足够的内存空间")
-        
-        with self.open_file() as f:
-            data = {
-                'image_features': f['image_features'][:],
-                'vector_features': f['vector_features'][:],
-                'labels': f['labels'][:]
-            }
-            
-            if 'metadata' in f:
-                data['metadata'] = f['metadata'][:]
-                
-        logger.info(f"已读取 {len(data['labels'])} 个样本到内存")
-        return data
+    def _load_existing_datasets(self):
+        """加载现有数据集"""
+        self.datasets = {
+            'images': self.file['images'],
+            'vectors': self.file['vectors'],
+            'labels': self.file['labels'],
+            'metadata': self.file['metadata']
+        }
     
-    def get_data_info(self) -> Dict:
+    def get_total_samples(self) -> int:
+        """获取总样本数"""
+        if 'labels' in self.datasets:
+            return self.datasets['labels'].shape[0]
+        elif 'labels' in self.file:
+            return self.file['labels'].shape[0]
+        else:
+            return 0
+    
+    def get_dataset_info(self) -> Dict:
         """获取数据集信息"""
-        with self.open_file() as f:
-            info = {
-                'total_samples': f.attrs.get('total_samples', len(f['labels'])),
-                'image_shape': f.attrs.get('image_shape', f['image_features'].shape[1:]),
-                'vector_dim': f.attrs.get('vector_dim', f['vector_features'].shape[1]),
-                'chunk_size': f.attrs.get('chunk_size', 100),
-                'file_size_mb': self.file_path.stat().st_size / (1024 * 1024),
-                'datasets': list(f.keys())
-            }
-            
-            # 检查每个数据集的实际大小
-            for dataset_name in ['image_features', 'vector_features', 'labels']:
-                if dataset_name in f:
-                    dataset = f[dataset_name]
-                    info[f'{dataset_name}_shape'] = dataset.shape
-                    info[f'{dataset_name}_dtype'] = str(dataset.dtype)
-                    
+        info = {}
+        for key in self.file.attrs.keys():
+            value = self.file.attrs[key]
+            if isinstance(value, str) and (value.startswith('[') or value.startswith('(')):
+                try:
+                    info[key] = json.loads(value)
+                except:
+                    info[key] = value
+            else:
+                info[key] = value
         return info
     
-    def create_data_iterator(self, batch_size: int = 32, shuffle: bool = False):
-        """
-        创建数据迭代器，用于模型训练
-        
-        Args:
-            batch_size: 批次大小
-            shuffle: 是否打乱数据顺序
-            
-        Yields:
-            批次数据字典
-        """
-        with self.open_file() as f:
-            total_samples = len(f['labels'])
-            
-            # 创建索引数组
-            indices = np.arange(total_samples)
-            if shuffle:
-                np.random.shuffle(indices)
-            
-            # 分批迭代
-            for start in range(0, total_samples, batch_size):
-                end = min(start + batch_size, total_samples)
-                batch_indices = indices[start:end]
-                
-                # 读取批次数据
-                batch_data = {
-                    'image_features': f['image_features'][batch_indices],
-                    'vector_features': f['vector_features'][batch_indices],
-                    'labels': f['labels'][batch_indices]
-                }
-                
-                if 'metadata' in f:
-                    batch_data['metadata'] = f['metadata'][batch_indices]
-                    
-                yield batch_data
-    
-    def split_train_test(self, test_ratio: float = 0.2, random_seed: int = 42) -> Tuple[List[int], List[int]]:
-        """
-        生成训练和测试索引
-        
-        Args:
-            test_ratio: 测试集比例
-            random_seed: 随机种子
-            
-        Returns:
-            (train_indices, test_indices)
-        """
-        with self.open_file() as f:
-            total_samples = len(f['labels'])
-            
-        # 生成随机索引
-        np.random.seed(random_seed)
-        all_indices = np.arange(total_samples)
-        np.random.shuffle(all_indices)
-        
-        # 划分训练和测试集
-        n_test = int(total_samples * test_ratio)
-        test_indices = all_indices[:n_test].tolist()
-        train_indices = all_indices[n_test:].tolist()
-        
-        logger.info(f"数据划分: 训练集={len(train_indices)}, 测试集={len(test_indices)}")
-        
-        return train_indices, test_indices
-    
-    def export_summary(self, output_path: str = None):
-        """导出数据集摘要信息"""
-        info = self.get_data_info()
-        
+    def export_summary(self, output_path: Optional[str] = None):
+        """导出数据集摘要"""
         if output_path is None:
-            output_path = str(self.file_path.with_suffix('.summary.txt'))
+            output_path = str(self.filepath.parent / f"{self.filepath.stem}_summary.txt")
+        
+        info = self.get_dataset_info()
+        total_samples = self.get_total_samples()
         
         with open(output_path, 'w', encoding='utf-8') as f:
-            f.write("HDF5数据集摘要信息\n")
-            f.write("=" * 40 + "\n\n")
+            f.write("=" * 60 + "\n")
+            f.write("HDF5数据集摘要\n")
+            f.write("=" * 60 + "\n\n")
             
-            f.write(f"文件路径: {self.file_path}\n")
-            f.write(f"文件大小: {info['file_size_mb']:.2f} MB\n")
-            f.write(f"总样本数: {info['total_samples']}\n")
-            f.write(f"图像特征形状: {info['image_shape']}\n")
-            f.write(f"数值特征维度: {info['vector_dim']}\n")
-            f.write(f"数据块大小: {info['chunk_size']}\n\n")
+            f.write(f"文件路径: {self.filepath}\n")
+            f.write(f"文件大小: {self.filepath.stat().st_size / (1024**3):.2f} GB\n")
+            f.write(f"实际样本数: {total_samples}\n\n")
             
-            f.write("数据集详情:\n")
-            f.write("-" * 20 + "\n")
+            f.write("数据集信息:\n")
             for key, value in info.items():
-                if key.endswith('_shape') or key.endswith('_dtype'):
-                    f.write(f"{key}: {value}\n")
+                f.write(f"  {key}: {value}\n")
+            
+            if total_samples > 0:
+                f.write("\n数据统计:\n")
+                
+                # 标签统计
+                labels = self.datasets['labels'][:total_samples]
+                f.write(f"  标签范围: {np.min(labels):.4f} - {np.max(labels):.4f}\n")
+                f.write(f"  标签均值: {np.mean(labels):.4f}\n")
+                f.write(f"  标签标准差: {np.std(labels):.4f}\n")
+                
+                # 高窜槽样本统计
+                high_channeling = np.sum(labels > 0.3)
+                f.write(f"  高窜槽样本 (>0.3): {high_channeling} ({high_channeling/total_samples*100:.1f}%)\n")
         
         logger.info(f"数据集摘要已导出: {output_path}")
+    
+    def close(self):
+        """关闭文件"""
+        if self.file:
+            self.file.close()
+            logger.debug("HDF5文件已关闭")
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 
 class BatchProcessor:
-    """批处理器 - 管理分块特征工程流程"""
+    """批处理器 - 支持增量数据写入"""
     
-    def __init__(self, hdf5_manager: HDF5DataManager, batch_size: int = 50):
+    def __init__(self, hdf5_manager: HDF5DataManager, batch_size: int = 100):
         """
         初始化批处理器
         
         Args:
-            hdf5_manager: HDF5数据管理器
+            hdf5_manager: HDF5管理器
             batch_size: 批处理大小
         """
         self.hdf5_manager = hdf5_manager
         self.batch_size = batch_size
-        self.current_index = 0
         
-        # 批次缓存
-        self.image_batch = []
-        self.vector_batch = []
-        self.label_batch = []
-        self.metadata_batch = []
+        # 批处理缓冲区
+        self.buffer_images = []
+        self.buffer_vectors = []
+        self.buffer_labels = []
+        self.buffer_metadata = []
+        
+        # 写入统计
+        self.total_written = 0
+        self.current_batch_idx = 0
+        
+        logger.info(f"批处理器初始化: 批大小 = {batch_size}")
     
     def add_sample(self, 
                   image_feature: np.ndarray,
                   vector_feature: np.ndarray,
                   label: float,
-                  metadata: Optional[Tuple] = None):
+                  metadata: Tuple):
         """
-        添加单个样本到批次缓存
+        添加单个样本到批处理缓冲区
         
         Args:
-            image_feature: 图像特征
-            vector_feature: 数值特征
-            label: 标签
-            metadata: 元数据元组 (depth, receiver_id, azimuth_sector, sample_id)
+            image_feature: 图像特征 (height, width)
+            vector_feature: 向量特征 (vector_dim,)
+            label: 标签值
+            metadata: 元数据 (depth, receiver_id, azimuth_sector, sample_id)
         """
-        self.image_batch.append(image_feature)
-        self.vector_batch.append(vector_feature)
-        self.label_batch.append(label)
+        self.buffer_images.append(image_feature)
+        self.buffer_vectors.append(vector_feature)
+        self.buffer_labels.append(label)
+        self.buffer_metadata.append(metadata)
         
-        if metadata is not None:
-            self.metadata_batch.append(metadata)
-        
-        # 如果批次已满，写入HDF5文件
-        if len(self.image_batch) >= self.batch_size:
-            self.flush_batch()
+        # 检查是否需要写入
+        if len(self.buffer_images) >= self.batch_size:
+            self._flush_buffer()
     
-    def flush_batch(self):
-        """将批次数据写入HDF5文件并清空缓存"""
-        if len(self.image_batch) == 0:
+    def _flush_buffer(self):
+        """将缓冲区数据写入HDF5文件"""
+        if not self.buffer_images:
             return
         
+        batch_size = len(self.buffer_images)
+        
         # 转换为numpy数组
-        image_features = np.array(self.image_batch)
-        vector_features = np.array(self.vector_batch)
-        labels = np.array(self.label_batch)
+        images_array = np.array(self.buffer_images, dtype=np.float32)
+        vectors_array = np.array(self.buffer_vectors, dtype=np.float32)
+        labels_array = np.array(self.buffer_labels, dtype=np.float32)
+        metadata_array = np.array(self.buffer_metadata, dtype=np.float32)
         
-        metadata = None
-        if self.metadata_batch:
-            metadata = np.array(self.metadata_batch, dtype=[
-                ('depth', 'f4'),
-                ('receiver_id', 'i4'),
-                ('azimuth_sector', 'i4'),
-                ('sample_id', 'i4')
-            ])
-        
-        # 写入HDF5文件
+        # 写入HDF5
+        start_idx = self.total_written
         self.hdf5_manager.write_batch(
-            self.current_index,
-            image_features,
-            vector_features,
-            labels,
-            metadata
+            start_idx=start_idx,
+            images=images_array,
+            vectors=vectors_array,
+            labels=labels_array,
+            metadata=metadata_array
         )
         
-        # 更新索引
-        batch_size = len(self.image_batch)
-        self.current_index += batch_size
+        # 更新统计
+        self.total_written += batch_size
+        self.current_batch_idx += 1
         
-        logger.info(f"已写入批次: {batch_size} 个样本, 累计: {self.current_index}")
+        logger.info(f"批次 {self.current_batch_idx} 已写入: {batch_size} 个样本 "
+                   f"(总计: {self.total_written})")
         
-        # 清空缓存，释放内存
-        self.image_batch.clear()
-        self.vector_batch.clear()
-        self.label_batch.clear()
-        self.metadata_batch.clear()
-        
-        # 强制垃圾回收
-        import gc
+        # 清空缓冲区并强制垃圾回收
+        self.buffer_images.clear()
+        self.buffer_vectors.clear()
+        self.buffer_labels.clear()
+        self.buffer_metadata.clear()
         gc.collect()
     
-    def finalize(self):
-        """完成处理，写入剩余数据"""
-        if len(self.image_batch) > 0:
-            self.flush_batch()
+    def finalize(self) -> int:
+        """
+        完成处理，写入剩余数据
         
-        logger.info(f"批处理完成，总计处理: {self.current_index} 个样本")
-        return self.current_index 
+        Returns:
+            总写入样本数
+        """
+        # 写入剩余数据
+        if self.buffer_images:
+            self._flush_buffer()
+        
+        logger.info(f"批处理完成: 总计写入 {self.total_written} 个样本")
+        return self.total_written
+
+
+class HDF5DataLoader:
+    """HDF5数据加载器 - 用于模型训练时的高效数据读取"""
+    
+    def __init__(self, hdf5_path: str):
+        """
+        初始化数据加载器
+        
+        Args:
+            hdf5_path: HDF5文件路径
+        """
+        self.hdf5_path = Path(hdf5_path)
+        if not self.hdf5_path.exists():
+            raise FileNotFoundError(f"HDF5文件不存在: {hdf5_path}")
+        
+        self.manager = HDF5DataManager(str(hdf5_path), mode='r')
+        self.manager._load_existing_datasets()
+        
+        logger.info(f"HDF5数据加载器初始化: {hdf5_path}")
+    
+    def get_batch_generator(self, batch_size: int = 32, shuffle: bool = True):
+        """
+        获取批数据生成器
+        
+        Args:
+            batch_size: 批大小
+            shuffle: 是否打乱数据
+            
+        Yields:
+            图像特征, 向量特征, 标签
+        """
+        total_samples = self.manager.get_total_samples()
+        indices = np.arange(total_samples)
+        
+        if shuffle:
+            np.random.shuffle(indices)
+        
+        for start_idx in range(0, total_samples, batch_size):
+            end_idx = min(start_idx + batch_size, total_samples)
+            batch_indices = indices[start_idx:end_idx]
+            
+            # 读取批数据
+            images = self.manager.datasets['images'][batch_indices]
+            vectors = self.manager.datasets['vectors'][batch_indices]
+            labels = self.manager.datasets['labels'][batch_indices]
+            
+            yield images, vectors, labels
+    
+    def load_all_data(self) -> Tuple:
+        """
+        加载所有数据到内存 (仅用于小数据集)
+        
+        Returns:
+            图像特征, 向量特征, 标签
+        """
+        total_samples = self.manager.get_total_samples()
+        logger.warning(f"将 {total_samples} 个样本全部加载到内存")
+        
+        images = self.manager.datasets['images'][:]
+        vectors = self.manager.datasets['vectors'][:]
+        labels = self.manager.datasets['labels'][:]
+        
+        return images, vectors, labels
+    
+    def get_sample(self, index: int) -> Tuple:
+        """
+        获取单个样本
+        
+        Args:
+            index: 样本索引
+            
+        Returns:
+            图像特征, 向量特征, 标签, 元数据
+        """
+        image = self.manager.datasets['images'][index]
+        vector = self.manager.datasets['vectors'][index]
+        label = self.manager.datasets['labels'][index]
+        metadata = self.manager.datasets['metadata'][index]
+        
+        return image, vector, label, metadata
+    
+    def close(self):
+        """关闭数据加载器"""
+        self.manager.close()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close() 
